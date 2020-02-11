@@ -1,6 +1,6 @@
 {
   "name": "multer-s3",
-  "version": "2.9.0",
+  "version": "2.10.0",
   "description": "Streaming multer storage engine for AWS S3",
   "main": "index.js",
   "scripts": {
@@ -25,7 +25,9 @@
   "dependencies": {
     "file-type": "^3.3.0",
     "is-svg": "^2.1.0",
-    "run-parallel": "^1.1.6"
+    "knox-mpu-alt": "^0.2.2",
+    "run-parallel": "^1.1.6",
+    "s3-upload-stream": "^1.0.7"
   },
   "devDependencies": {
     "aws-sdk": "^2.2.32",

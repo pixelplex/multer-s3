@@ -3,8 +3,9 @@ var stream = require('stream')
 var fileType = require('file-type')
 var isSvg = require('is-svg')
 var parallel = require('run-parallel')
+var s3Stream = require('s3-upload-stream')
 
-function staticValue (value) {
+function staticValue(value) {
   return function (req, file, cb) {
     cb(null, value)
   }
@@ -19,14 +20,16 @@ var defaultContentDisposition = staticValue(null)
 var defaultStorageClass = staticValue('STANDARD')
 var defaultSSE = staticValue(null)
 var defaultSSEKMS = staticValue(null)
+var defaultMaxPartSize = staticValue(20971520)
+var defaultConcurrentParts = staticValue(5)
 
-function defaultKey (req, file, cb) {
+function defaultKey(req, file, cb) {
   crypto.randomBytes(16, function (err, raw) {
     cb(err, err ? undefined : raw.toString('hex'))
   })
 }
 
-function autoContentType (req, file, cb) {
+function autoContentType(req, file, cb) {
   file.stream.once('data', function (firstChunk) {
     var type = fileType(firstChunk)
     var mime
@@ -48,7 +51,7 @@ function autoContentType (req, file, cb) {
   })
 }
 
-function collect (storage, req, file, cb) {
+function collect(storage, req, file, cb) {
   parallel([
     storage.getBucket.bind(storage, req, file),
     storage.getKey.bind(storage, req, file),
@@ -58,7 +61,9 @@ function collect (storage, req, file, cb) {
     storage.getContentDisposition.bind(storage, req, file),
     storage.getStorageClass.bind(storage, req, file),
     storage.getSSE.bind(storage, req, file),
-    storage.getSSEKMS.bind(storage, req, file)
+    storage.getSSEKMS.bind(storage, req, file),
+    storage.getMaxPartSize.bind(storage, req, file),
+    storage.getConcurrentParts.bind(storage, req, file)
   ], function (err, values) {
     if (err) return cb(err)
 
@@ -76,13 +81,29 @@ function collect (storage, req, file, cb) {
         contentType: contentType,
         replacementStream: replacementStream,
         serverSideEncryption: values[7],
-        sseKmsKeyId: values[8]
+        sseKmsKeyId: values[8],
+        maxPartSize: values[9],
+        concurrentParts: values[10]
       })
     })
   })
 }
 
-function S3Storage (opts) {
+function S3Storage(opts) {
+  switch (typeof opts.maxPartSize) {
+    case 'function': this.getMaxPartSize = opts.maxPartSize; break
+    case 'string': this.getMaxPartSize = staticValue(opts.maxPartSize); break
+    case 'undefined': this.getMaxPartSize = defaultMaxPartSize; break;
+    default: throw new TypeError('Expected opts.bucket to be undefined, string or function')
+  }
+
+  switch (typeof opts.concurrentParts) {
+    case 'function': this.getConcurrentParts = opts.concurrentParts; break
+    case 'string': this.getConcurrentParts = staticValue(opts.concurrentParts); break
+    case 'undefined': this.getConcurrentParts = defaultConcurrentParts; break;
+    default: throw new TypeError('Expected opts.bucket to be undefined, string or function')
+  }
+
   switch (typeof opts.s3) {
     case 'object': this.s3 = opts.s3; break
     default: throw new TypeError('Expected opts.s3 to be object')
@@ -160,8 +181,6 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
   collect(this, req, file, function (err, opts) {
     if (err) return cb(err)
 
-    var currentSize = 0
-
     var params = {
       Bucket: opts.bucket,
       Key: opts.key,
@@ -172,23 +191,29 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       StorageClass: opts.storageClass,
       ServerSideEncryption: opts.serverSideEncryption,
       SSEKMSKeyId: opts.sseKmsKeyId,
-      Body: (opts.replacementStream || file.stream)
     }
 
     if (opts.contentDisposition) {
       params.ContentDisposition = opts.contentDisposition
     }
 
-    var upload = this.s3.upload(params)
+    var currentSize = 0
 
-    upload.on('httpUploadProgress', function (ev) {
-      if (ev.total) currentSize = ev.total
-    })
+    s3StreamInst = s3Stream(this.s3)
+    var upload = s3StreamInst.upload(params);
+    upload.maxPartSize(opts.maxPartSize);
+    upload.concurrentParts(opts.concurrentParts);
 
-    upload.send(function (err, result) {
-      if (err) return cb(err)
+    upload.on('error', function (error) {
+      console.log('multer-s3-multipart', JSON.stringify(error, null, 1));
+    });
 
-      cb(null, {
+    upload.on('part', function (details) {
+      currentSize = details.uploadedSize;
+    });
+
+    upload.on('uploaded', function (details) {
+      return cb(null, {
         size: currentSize,
         bucket: opts.bucket,
         key: opts.key,
@@ -198,11 +223,12 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         storageClass: opts.storageClass,
         serverSideEncryption: opts.serverSideEncryption,
         metadata: opts.metadata,
-        location: result.Location,
-        etag: result.ETag,
-        versionId: result.VersionId
+        location: details.Location,
+        etag: details.ETag,
       })
-    })
+    });
+
+    file.stream.pipe(upload);
   })
 }
 
